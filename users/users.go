@@ -5,16 +5,24 @@ package users
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/mainflux/mainflux/errors"
 )
 
+const (
+	maxEmailLength = 254 // based on RFC3696 errata: https://www.rfc-editor.org/errata_search.php?rfc=3696&eid=1690
+	maxLocalLength = 64  // based on RFC3696
+
+	// Allowed email address character class (ascii + non-ascii(utf8))
+	emailCharClass = "[[:alnum:]!#$%&'*+-/=?^_`{|}~]" + // acceptable ascii characters: alpha, numeric, subset of special characters
+		"[\\x01-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]|\\x21|[\\x23-\\x5b]|[\\x5d-\\x7e]|[\\x{00A0}-\\x{D7FF}\\x{F900}-\\x{FDCF}\\x{FDF0}-\\x{FFEF}]" // covers non-ascii utf8 characters
+)
+
 var (
-	userRegexp    = regexp.MustCompile("^[a-zA-Z0-9!#$%&'*+/=?^_`{|}~.-]+$")
-	hostRegexp    = regexp.MustCompile("^[^\\s]+\\.[^\\s]+$")
-	userDotRegexp = regexp.MustCompile("(^[.]{1})|([.]{1}$)|([.]{2,})")
+	emailRe = regexp.MustCompile(fmt.Sprintf("^(%s)+(\\.(%s))*@(%s)+(\\.(%s))*$", emailCharClass, emailCharClass, emailCharClass, emailCharClass))
 )
 
 // User represents a Mainflux user account. Each user is identified given its
@@ -56,23 +64,22 @@ type UserRepository interface {
 }
 
 func isEmail(email string) bool {
-	if len(email) < 6 || len(email) > 254 {
-		return false
-	}
-
 	at := strings.LastIndex(email, "@")
-	if at <= 0 || at > len(email)-3 {
+	if at < 1 {
 		return false
 	}
 
-	user := email[:at]
-	host := email[at+1:]
+	localLength := len(email[:at])
+	hostLength := len(email[at+1:])
+	maxHostLength := maxEmailLength - localLength - 1 // maxEmailLength - localLength - len("@")
 
-	if len(user) > 64 {
+	if len(email) > maxEmailLength ||
+		localLength > maxLocalLength ||
+		hostLength > maxHostLength {
 		return false
 	}
 
-	if userDotRegexp.MatchString(user) || !userRegexp.MatchString(user) || !hostRegexp.MatchString(host) {
+	if !emailRe.MatchString(email) {
 		return false
 	}
 
