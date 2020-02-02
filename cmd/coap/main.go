@@ -8,11 +8,8 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	gocoap "github.com/dustin/go-coap"
@@ -21,6 +18,7 @@ import (
 	"github.com/mainflux/mainflux/coap"
 	"github.com/mainflux/mainflux/coap/api"
 	"github.com/mainflux/mainflux/coap/nats"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	logger "github.com/mainflux/mainflux/logger"
 	thingsapi "github.com/mainflux/mainflux/things/api/auth/grpc"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -111,17 +109,15 @@ func main() {
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(cfg.port, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHTTPHandler(), "", "")
+	go httpServer.Start(logger, errs)
+
+	// TODO: Make COAP server gracefully stoppable
 	go startCOAPServer(cfg, svc, cc, respChan, logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("CoAP adapter terminated: %s", err))
+	logger.Info("CoAP adapter terminated")
 }
 
 func loadConfig() config {
@@ -203,12 +199,6 @@ func initJaeger(svcName, url string, logger logger.Logger) (opentracing.Tracer, 
 	}
 
 	return tracer, closer
-}
-
-func startHTTPServer(port string, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	logger.Info(fmt.Sprintf("CoAP service started, exposed port %s", port))
-	errs <- http.ListenAndServe(p, api.MakeHTTPHandler())
 }
 
 func startCOAPServer(cfg config, svc coap.Service, auth mainflux.ThingsServiceClient, respChan chan<- string, l logger.Logger, errs chan error) {

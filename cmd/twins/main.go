@@ -8,13 +8,11 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/twins/mqtt"
 
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
@@ -148,16 +146,12 @@ func main() {
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(twapi.MakeHandler(tracer, svc), cfg.httpPort, cfg, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.httpPort), twapi.MakeHandler(tracer, svc), cfg.serverCert, cfg.serverKey)
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Twins service terminated: %s", err))
+	logger.Info("Twins service terminated")
 }
 
 func loadConfig() config {
@@ -283,16 +277,4 @@ func newService(nc *nats.Conn, ncTracer opentracing.Tracer, mc mqtt.Mqtt, mcTrac
 	twnats.Subscribe(nc, mc, svc, logger)
 
 	return svc
-}
-
-func startHTTPServer(handler http.Handler, port string, cfg config, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	if cfg.serverCert != "" || cfg.serverKey != "" {
-		logger.Info(fmt.Sprintf("Twins service started using https on port %s with cert %s key %s",
-			port, cfg.serverCert, cfg.serverKey))
-		errs <- http.ListenAndServeTLS(p, cfg.serverCert, cfg.serverKey, handler)
-		return
-	}
-	logger.Info(fmt.Sprintf("Twins service started using http on port %s", cfg.httpPort))
-	errs <- http.ListenAndServe(p, handler)
 }

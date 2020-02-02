@@ -8,16 +8,14 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	"github.com/jmoiron/sqlx"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/readers"
 	"github.com/mainflux/mainflux/readers/api"
@@ -103,16 +101,12 @@ func main() {
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(repo, tc, cfg.port, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHandler(repo, tc, svcName), "", "")
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Postgres writer service terminated: %s", err))
+	logger.Info("Postgres writer service terminated")
 }
 
 func loadConfig() config {
@@ -220,10 +214,4 @@ func newService(db *sqlx.DB, logger logger.Logger) readers.MessageRepository {
 	)
 
 	return svc
-}
-
-func startHTTPServer(repo readers.MessageRepository, tc mainflux.ThingsServiceClient, port string, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	logger.Info(fmt.Sprintf("Postgres reader service started, exposed port %s", port))
-	errs <- http.ListenAndServe(p, api.MakeHandler(repo, tc, svcName))
 }

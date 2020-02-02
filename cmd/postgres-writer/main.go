@@ -7,15 +7,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/BurntSushi/toml"
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	"github.com/jmoiron/sqlx"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/transformers/senml"
 	"github.com/mainflux/mainflux/writers"
@@ -82,22 +80,19 @@ func main() {
 
 	repo := newService(db, logger)
 	st := senml.New()
+	// TODO: consider adding graceful Stop method
 	if err = writers.Start(nc, repo, st, svcName, cfg.channels, logger); err != nil {
 		logger.Error(fmt.Sprintf("Failed to create Postgres writer: %s", err))
 	}
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(cfg.port, errs, logger)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHandler(svcName), "", "")
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Postgres writer service terminated: %s", err))
+	logger.Info("Postgres writer service terminated")
 }
 
 func loadConfig() config {
@@ -189,10 +184,4 @@ func newService(db *sqlx.DB, logger logger.Logger) writers.MessageRepository {
 	)
 
 	return svc
-}
-
-func startHTTPServer(port string, errs chan error, logger logger.Logger) {
-	p := fmt.Sprintf(":%s", port)
-	logger.Info(fmt.Sprintf("Postgres writer service started, exposed port %s", port))
-	errs <- http.ListenAndServe(p, api.MakeHandler(svcName))
 }

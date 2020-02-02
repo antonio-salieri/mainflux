@@ -9,16 +9,14 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	authapi "github.com/mainflux/mainflux/authn/api/grpc"
 	rediscons "github.com/mainflux/mainflux/bootstrap/redis/consumer"
 	redisprod "github.com/mainflux/mainflux/bootstrap/redis/producer"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	opentracing "github.com/opentracing/opentracing-go"
 
@@ -148,17 +146,19 @@ func main() {
 	svc := newService(auth, db, logger, esClient, cfg)
 	errs := make(chan error, 2)
 
-	go startHTTPServer(svc, cfg, logger, errs)
+	httpServer := server.NewHTTPServer(
+		fmt.Sprintf(":%s", cfg.httpPort),
+		api.MakeHandler(svc, bootstrap.NewConfigReader(cfg.encKey)),
+		cfg.serverCert,
+		cfg.serverKey)
+	go httpServer.Start(logger, errs)
+
+	// TODO: consider adding monitoring for graceful unsubscribe when termination signal is received
 	go subscribeToThingsES(svc, thingsESConn, cfg.esConsumerName, logger)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Bootstrap service terminated: %s", err))
+	logger.Info("Bootstrap service terminated")
 }
 
 func loadConfig() config {
@@ -318,18 +318,6 @@ func connectToAuth(cfg config, logger logger.Logger) *grpc.ClientConn {
 	}
 
 	return conn
-}
-
-func startHTTPServer(svc bootstrap.Service, cfg config, logger mflog.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", cfg.httpPort)
-	if cfg.serverCert != "" || cfg.serverKey != "" {
-		logger.Info(fmt.Sprintf("Bootstrap service started using https on port %s with cert %s key %s",
-			cfg.httpPort, cfg.serverCert, cfg.serverKey))
-		errs <- http.ListenAndServeTLS(p, cfg.serverCert, cfg.serverKey, api.MakeHandler(svc, bootstrap.NewConfigReader(cfg.encKey)))
-		return
-	}
-	logger.Info(fmt.Sprintf("Bootstrap service started using http on port %s", cfg.httpPort))
-	errs <- http.ListenAndServe(p, api.MakeHandler(svc, bootstrap.NewConfigReader(cfg.encKey)))
 }
 
 func subscribeToThingsES(svc bootstrap.Service, client *r.Client, consumer string, logger mflog.Logger) {

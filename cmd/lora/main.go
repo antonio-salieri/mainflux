@@ -6,15 +6,13 @@ package main
 import (
 	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 
 	mqttPaho "github.com/eclipse/paho.mqtt.golang"
 	r "github.com/go-redis/redis"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/lora"
 	"github.com/mainflux/mainflux/lora/api"
@@ -114,21 +112,19 @@ func main() {
 		}, []string{"method"}),
 	)
 
+	// TODO: consider adding monitoring for graceful unsubscribe
 	go subscribeToLoRaBroker(svc, mqttConn, logger)
+	// TODO: consider adding monitoring for graceful unsubscribe
 	go subscribeToThingsES(svc, esConn, cfg.esConsumerName, logger)
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(cfg, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.httpPort), api.MakeHandler(), "", "")
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("LoRa adapter terminated: %s", err))
+	logger.Info("LoRa adapter terminated")
 }
 
 func loadConfig() config {
@@ -214,10 +210,4 @@ func subscribeToThingsES(svc lora.Service, client *r.Client, consumer string, lo
 func newRouteMapRepositoy(client *r.Client, prefix string, logger logger.Logger) lora.RouteMapRepository {
 	logger.Info(fmt.Sprintf("Connected to %s Redis Route-map", prefix))
 	return redis.NewRouteMapRepository(client, prefix)
-}
-
-func startHTTPServer(cfg config, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", cfg.httpPort)
-	logger.Info(fmt.Sprintf("lora-adapter service started, exposed port %s", cfg.httpPort))
-	errs <- http.ListenAndServe(p, api.MakeHandler())
 }

@@ -8,14 +8,12 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/mainflux/mainflux/internal/email"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/users"
 	"github.com/mainflux/mainflux/users/emailer"
 	"github.com/mainflux/mainflux/users/tracing"
@@ -150,16 +148,12 @@ func main() {
 	svc := newService(db, dbTracer, auth, cfg, logger)
 	errs := make(chan error, 2)
 
-	go startHTTPServer(tracer, svc, cfg.httpPort, cfg.serverCert, cfg.serverKey, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.httpPort), api.MakeHandler(svc, tracer, logger), cfg.serverCert, cfg.serverKey)
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Users service terminated: %s", err))
+	logger.Info("Users service terminated")
 }
 
 func loadConfig() config {
@@ -301,15 +295,4 @@ func newService(db *sqlx.DB, tracer opentracing.Tracer, auth mainflux.AuthNServi
 	)
 
 	return svc
-}
-
-func startHTTPServer(tracer opentracing.Tracer, svc users.Service, port string, certFile string, keyFile string, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	if certFile != "" || keyFile != "" {
-		logger.Info(fmt.Sprintf("Users service started using https, cert %s key %s, exposed port %s", certFile, keyFile, port))
-		errs <- http.ListenAndServeTLS(p, certFile, keyFile, api.MakeHandler(svc, tracer, logger))
-	} else {
-		logger.Info(fmt.Sprintf("Users service started using http, exposed port %s", port))
-		errs <- http.ListenAndServe(p, api.MakeHandler(svc, tracer, logger))
-	}
 }

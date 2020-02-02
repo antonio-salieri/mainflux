@@ -8,15 +8,13 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	thingsapi "github.com/mainflux/mainflux/things/api/auth/grpc"
 	adapter "github.com/mainflux/mainflux/ws"
@@ -88,20 +86,12 @@ func main() {
 
 	errs := make(chan error, 2)
 
-	go func() {
-		p := fmt.Sprintf(":%s", cfg.port)
-		logger.Info(fmt.Sprintf("WebSocket adapter service started, exposed port %s", cfg.port))
-		errs <- http.ListenAndServe(p, api.MakeHandler(svc, cc, logger))
-	}()
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHandler(svc, cc, logger), "", "")
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("WebSocket adapter terminated: %s", err))
+	logger.Info("WebSocket adapter terminated")
 }
 
 func loadConfig() config {

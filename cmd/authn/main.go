@@ -5,11 +5,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	"github.com/jmoiron/sqlx"
@@ -22,12 +18,11 @@ import (
 	"github.com/mainflux/mainflux/authn/postgres"
 	"github.com/mainflux/mainflux/authn/tracing"
 	mfidp "github.com/mainflux/mainflux/authn/uuid"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/opentracing/opentracing-go"
 	stdprometheus "github.com/prometheus/client_golang/prometheus"
 	jconfig "github.com/uber/jaeger-client-go/config"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -103,17 +98,24 @@ func main() {
 	svc := newService(db, dbTracer, cfg.secret, logger)
 	errs := make(chan error, 2)
 
-	go startHTTPServer(tracer, svc, cfg.httpPort, cfg.serverCert, cfg.serverKey, logger, errs)
-	go startGRPCServer(tracer, svc, cfg.grpcPort, cfg.serverCert, cfg.serverKey, logger, errs)
+	httpServer := server.NewHTTPServer(
+		fmt.Sprintf(":%s", cfg.httpPort),
+		httpapi.MakeHandler(svc, tracer),
+		cfg.serverCert,
+		cfg.serverKey)
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	grpcServer := server.NewGRPCServer(
+		fmt.Sprintf(":%s", cfg.grpcPort),
+		cfg.serverCert,
+		cfg.serverKey,
+		logger,
+	)
+	go grpcServer.Start(logger, errs, func() { mainflux.RegisterAuthNServiceServer(grpcServer.Server, grpcapi.NewServer(tracer, svc)) })
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Authentication service terminated: %s", err))
+	server.Monitor(logger, errs, httpServer, grpcServer)
+
+	logger.Info("Authentication service terminated")
 }
 
 func loadConfig() config {
@@ -200,42 +202,4 @@ func newService(db *sqlx.DB, tracer opentracing.Tracer, secret string, logger lo
 	)
 
 	return svc
-}
-
-func startHTTPServer(tracer opentracing.Tracer, svc authn.Service, port string, certFile string, keyFile string, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	if certFile != "" || keyFile != "" {
-		logger.Info(fmt.Sprintf("Authentication service started using https, cert %s key %s, exposed port %s", certFile, keyFile, port))
-		errs <- http.ListenAndServeTLS(p, certFile, keyFile, httpapi.MakeHandler(svc, tracer))
-		return
-	}
-	logger.Info(fmt.Sprintf("Authentication service started using http, exposed port %s", port))
-	errs <- http.ListenAndServe(p, httpapi.MakeHandler(svc, tracer))
-
-}
-
-func startGRPCServer(tracer opentracing.Tracer, svc authn.Service, port string, certFile string, keyFile string, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	listener, err := net.Listen("tcp", p)
-	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to listen on port %s: %s", port, err))
-	}
-
-	var server *grpc.Server
-	if certFile != "" || keyFile != "" {
-		creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
-		if err != nil {
-			logger.Error(fmt.Sprintf("Failed to load authn certificates: %s", err))
-			os.Exit(1)
-		}
-		logger.Info(fmt.Sprintf("Authentication gRPC service started using https on port %s with cert %s key %s", port, certFile, keyFile))
-		server = grpc.NewServer(grpc.Creds(creds))
-	} else {
-		logger.Info(fmt.Sprintf("Authentication gRPC service started using http on port %s", port))
-		server = grpc.NewServer()
-	}
-
-	mainflux.RegisterAuthNServiceServer(server, grpcapi.NewServer(tracer, svc))
-	logger.Info(fmt.Sprintf("Authentication gRPC service started, exposed port %s", port))
-	errs <- server.Serve(listener)
 }

@@ -5,16 +5,14 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	influxdata "github.com/influxdata/influxdb/client/v2"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/readers"
 	"github.com/mainflux/mainflux/readers/api"
@@ -28,6 +26,8 @@ import (
 )
 
 const (
+	serviceName = "influxdb-reader"
+
 	defThingsURL     = "localhost:8181"
 	defLogLevel      = "error"
 	defPort          = "8180"
@@ -100,16 +100,13 @@ func main() {
 	repo := newService(client, cfg.dbName, logger)
 
 	errs := make(chan error, 2)
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
 
-	go startHTTPServer(repo, tc, cfg, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHandler(repo, tc, serviceName), cfg.serverCert, cfg.serverKey)
+	go httpServer.Start(logger, errs)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("InfluxDB writer service terminated: %s", err))
+	server.Monitor(logger, errs, httpServer)
+
+	logger.Info("InfluxDB writer service terminated")
 }
 
 func loadConfigs() (config, influxdata.HTTPConfig) {
@@ -217,16 +214,4 @@ func newService(client influxdata.Client, dbName string, logger logger.Logger) r
 	)
 
 	return repo
-}
-
-func startHTTPServer(repo readers.MessageRepository, tc mainflux.ThingsServiceClient, cfg config, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", cfg.port)
-	if cfg.serverCert != "" || cfg.serverKey != "" {
-		logger.Info(fmt.Sprintf("InfluxDB reader service started using https on port %s with cert %s key %s",
-			cfg.port, cfg.serverCert, cfg.serverKey))
-		errs <- http.ListenAndServeTLS(p, cfg.serverCert, cfg.serverKey, api.MakeHandler(repo, tc, "influxdb-reader"))
-		return
-	}
-	logger.Info(fmt.Sprintf("InfluxDB reader service started, exposed port %s", cfg.port))
-	errs <- http.ListenAndServe(p, api.MakeHandler(repo, tc, "influxdb-reader"))
 }

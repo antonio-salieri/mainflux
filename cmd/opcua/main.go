@@ -7,14 +7,12 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 
 	r "github.com/go-redis/redis"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/opcua"
 	"github.com/mainflux/mainflux/opcua/api"
@@ -124,20 +122,17 @@ func main() {
 	)
 
 	go subscribeToStoredSubs(sub, cfg.opcuaConfig, logger)
+	// TODO: consider adding graceful unsubscribe from ES
 	go subscribeToThingsES(svc, esConn, cfg.esConsumerName, logger)
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(svc, cfg, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.httpPort), api.MakeHandler(svc), "", "")
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("OPC-UA adapter terminated: %s", err))
+	logger.Info("OPC-UA adapter terminated")
 }
 
 func loadConfig() config {
@@ -221,10 +216,4 @@ func subscribeToThingsES(svc opcua.Service, client *r.Client, prefix string, log
 func newRouteMapRepositoy(client *r.Client, prefix string, logger logger.Logger) opcua.RouteMapRepository {
 	logger.Info(fmt.Sprintf("Connected to %s Redis Route-map", prefix))
 	return redis.NewRouteMapRepository(client, prefix)
-}
-
-func startHTTPServer(svc opcua.Service, cfg config, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", cfg.httpPort)
-	logger.Info(fmt.Sprintf("opcua-adapter service started, exposed port %s", cfg.httpPort))
-	errs <- http.ListenAndServe(p, api.MakeHandler(svc))
 }

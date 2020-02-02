@@ -7,15 +7,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/BurntSushi/toml"
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	influxdata "github.com/influxdata/influxdb/client/v2"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/transformers/senml"
 	"github.com/mainflux/mainflux/writers"
@@ -89,22 +87,20 @@ func main() {
 	repo = api.LoggingMiddleware(repo, logger)
 	repo = api.MetricsMiddleware(repo, counter, latency)
 	st := senml.New()
+	// TODO: consider adding graceful Stop method
 	if err := writers.Start(nc, repo, st, svcName, cfg.channels, logger); err != nil {
 		logger.Error(fmt.Sprintf("Failed to start InfluxDB writer: %s", err))
 		os.Exit(1)
 	}
 
 	errs := make(chan error, 2)
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
 
-	go startHTTPService(cfg.port, logger, errs)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHandler(svcName), "", "")
+	go httpServer.Start(logger, errs)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("InfluxDB writer service terminated: %s", err))
+	server.Monitor(logger, errs, httpServer)
+
+	logger.Info("InfluxDB writer service terminated")
 }
 
 func loadConfigs() (config, influxdata.HTTPConfig) {
@@ -173,10 +169,4 @@ func makeMetrics() (*kitprometheus.Counter, *kitprometheus.Summary) {
 	}, []string{"method"})
 
 	return counter, latency
-}
-
-func startHTTPService(port string, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	logger.Info(fmt.Sprintf("InfluxDB writer service started, exposed port %s", p))
-	errs <- http.ListenAndServe(p, api.MakeHandler(svcName))
 }

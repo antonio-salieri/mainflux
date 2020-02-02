@@ -8,17 +8,15 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	"github.com/gocql/gocql"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/readers"
 	"github.com/mainflux/mainflux/readers/api"
@@ -32,7 +30,8 @@ import (
 )
 
 const (
-	sep = ","
+	serviceName = "cassandra-reader"
+	sep         = ","
 
 	defLogLevel      = "error"
 	defPort          = "8180"
@@ -100,16 +99,15 @@ func main() {
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(repo, tc, cfg, errs, logger)
+	httpServer := server.NewHTTPServer(
+		fmt.Sprintf(":%s", cfg.port),
+		api.MakeHandler(repo, tc, serviceName),
+		cfg.serverCert, cfg.serverKey)
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Cassandra reader service terminated: %s", err))
+	logger.Info("Cassandra reader service terminated")
 }
 
 func loadConfig() config {
@@ -228,16 +226,4 @@ func newService(session *gocql.Session, logger logger.Logger) readers.MessageRep
 	)
 
 	return repo
-}
-
-func startHTTPServer(repo readers.MessageRepository, tc mainflux.ThingsServiceClient, cfg config, errs chan error, logger logger.Logger) {
-	p := fmt.Sprintf(":%s", cfg.port)
-	if cfg.serverCert != "" || cfg.serverKey != "" {
-		logger.Info(fmt.Sprintf("Cassandra reader service started using https on port %s with cert %s key %s",
-			cfg.port, cfg.serverCert, cfg.serverKey))
-		errs <- http.ListenAndServeTLS(p, cfg.serverCert, cfg.serverKey, api.MakeHandler(repo, tc, "cassandra-reader"))
-		return
-	}
-	logger.Info(fmt.Sprintf("Cassandra reader service started, exposed port %s", cfg.port))
-	errs <- http.ListenAndServe(p, api.MakeHandler(repo, tc, "cassandra-reader"))
 }

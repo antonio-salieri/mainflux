@@ -8,11 +8,8 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	"google.golang.org/grpc/credentials"
@@ -22,6 +19,7 @@ import (
 	adapter "github.com/mainflux/mainflux/http"
 	"github.com/mainflux/mainflux/http/api"
 	"github.com/mainflux/mainflux/http/nats"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	thingsapi "github.com/mainflux/mainflux/things/api/auth/grpc"
 	broker "github.com/nats-io/go-nats"
@@ -110,20 +108,11 @@ func main() {
 
 	errs := make(chan error, 2)
 
-	go func() {
-		p := fmt.Sprintf(":%s", cfg.port)
-		logger.Info(fmt.Sprintf("HTTP adapter service started on port %s", cfg.port))
-		errs <- http.ListenAndServe(p, api.MakeHandler(svc, tracer))
-	}()
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHandler(svc, tracer), "", "")
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
-
-	err = <-errs
-	logger.Error(fmt.Sprintf("HTTP adapter terminated: %s", err))
+	server.Monitor(logger, errs, httpServer)
+	logger.Info("HTTP adapter terminated")
 }
 
 func loadConfig() config {

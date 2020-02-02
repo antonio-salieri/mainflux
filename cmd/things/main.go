@@ -8,14 +8,11 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/things/tracing"
 
 	"github.com/jmoiron/sqlx"
@@ -159,18 +156,32 @@ func main() {
 	svc := newService(auth, dbTracer, cacheTracer, db, cacheClient, esClient, logger)
 	errs := make(chan error, 2)
 
-	go startHTTPServer(thhttpapi.MakeHandler(thingsTracer, svc), cfg.httpPort, cfg, logger, errs)
-	go startHTTPServer(authhttpapi.MakeHandler(thingsTracer, svc), cfg.authHTTPPort, cfg, logger, errs)
-	go startGRPCServer(svc, thingsTracer, cfg, logger, errs)
+	thingHTTP := server.NewHTTPServer(
+		fmt.Sprintf(":%s", cfg.httpPort),
+		thhttpapi.MakeHandler(thingsTracer, svc),
+		cfg.serverCert,
+		cfg.serverKey)
+	go thingHTTP.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	authHTTP := server.NewHTTPServer(
+		fmt.Sprintf(":%s", cfg.authHTTPPort),
+		authhttpapi.MakeHandler(thingsTracer, svc),
+		cfg.serverCert,
+		cfg.serverKey)
+	go authHTTP.Start(logger, errs)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Things service terminated: %s", err))
+	authGrpc := server.NewGRPCServer(
+		fmt.Sprintf(":%s", cfg.authGRPCPort),
+		cfg.serverCert,
+		cfg.serverKey,
+		logger)
+	go authGrpc.Start(logger, errs, func() {
+		mainflux.RegisterThingsServiceServer(authGrpc.Server, authgrpcapi.NewServer(thingsTracer, svc))
+	})
+
+	server.Monitor(logger, errs, thingHTTP, authHTTP, authGrpc)
+
+	logger.Info("Things service terminated")
 }
 
 func loadConfig() config {
@@ -336,43 +347,4 @@ func newService(auth mainflux.AuthNServiceClient, dbTracer opentracing.Tracer, c
 		}, []string{"method"}),
 	)
 	return svc
-}
-
-func startHTTPServer(handler http.Handler, port string, cfg config, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", port)
-	if cfg.serverCert != "" || cfg.serverKey != "" {
-		logger.Info(fmt.Sprintf("Things service started using https on port %s with cert %s key %s",
-			port, cfg.serverCert, cfg.serverKey))
-		errs <- http.ListenAndServeTLS(p, cfg.serverCert, cfg.serverKey, handler)
-		return
-	}
-	logger.Info(fmt.Sprintf("Things service started using http on port %s", cfg.httpPort))
-	errs <- http.ListenAndServe(p, handler)
-}
-
-func startGRPCServer(svc things.Service, tracer opentracing.Tracer, cfg config, logger logger.Logger, errs chan error) {
-	p := fmt.Sprintf(":%s", cfg.authGRPCPort)
-	listener, err := net.Listen("tcp", p)
-	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to listen on port %s: %s", cfg.authGRPCPort, err))
-		os.Exit(1)
-	}
-
-	var server *grpc.Server
-	if cfg.serverCert != "" || cfg.serverKey != "" {
-		creds, err := credentials.NewServerTLSFromFile(cfg.serverCert, cfg.serverKey)
-		if err != nil {
-			logger.Error(fmt.Sprintf("Failed to load things certificates: %s", err))
-			os.Exit(1)
-		}
-		logger.Info(fmt.Sprintf("Things gRPC service started using https on port %s with cert %s key %s",
-			cfg.authGRPCPort, cfg.serverCert, cfg.serverKey))
-		server = grpc.NewServer(grpc.Creds(creds))
-	} else {
-		logger.Info(fmt.Sprintf("Things gRPC service started using http on port %s", cfg.authGRPCPort))
-		server = grpc.NewServer()
-	}
-
-	mainflux.RegisterThingsServiceServer(server, authgrpcapi.NewServer(tracer, svc))
-	errs <- server.Serve(listener)
 }

@@ -7,17 +7,15 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/BurntSushi/toml"
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	"github.com/gocql/gocql"
 	"github.com/mainflux/mainflux"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 	"github.com/mainflux/mainflux/transformers/senml"
 	"github.com/mainflux/mainflux/writers"
@@ -76,22 +74,19 @@ func main() {
 
 	repo := newService(session, logger)
 	st := senml.New()
+	// TODO: consider adding graceful Stop method
 	if err := writers.Start(nc, repo, st, svcName, cfg.channels, logger); err != nil {
 		logger.Error(fmt.Sprintf("Failed to create Cassandra writer: %s", err))
 	}
 
 	errs := make(chan error, 2)
 
-	go startHTTPServer(cfg.port, errs, logger)
+	httpServer := server.NewHTTPServer(fmt.Sprintf(":%s", cfg.port), api.MakeHandler(svcName), "", "")
+	go httpServer.Start(logger, errs)
 
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, syscall.SIGINT)
-		errs <- fmt.Errorf("%s", <-c)
-	}()
+	server.Monitor(logger, errs, httpServer)
 
-	err = <-errs
-	logger.Error(fmt.Sprintf("Cassandra writer service terminated: %s", err))
+	logger.Info("Cassandra writer service terminated")
 }
 
 func loadConfig() config {
@@ -185,10 +180,4 @@ func newService(session *gocql.Session, logger logger.Logger) writers.MessageRep
 	)
 
 	return repo
-}
-
-func startHTTPServer(port string, errs chan error, logger logger.Logger) {
-	p := fmt.Sprintf(":%s", port)
-	logger.Info(fmt.Sprintf("Cassandra writer service started, exposed port %s", port))
-	errs <- http.ListenAndServe(p, api.MakeHandler(svcName))
 }
