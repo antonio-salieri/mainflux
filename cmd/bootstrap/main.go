@@ -153,10 +153,10 @@ func main() {
 		cfg.serverKey)
 	go httpServer.Start(logger, errs)
 
-	// TODO: consider adding monitoring for graceful unsubscribe when termination signal is received
-	go subscribeToThingsES(svc, thingsESConn, cfg.esConsumerName, logger)
+	eventStore := rediscons.NewEventStore(svc, thingsESConn, cfg.esConsumerName, logger)
+	go subscribeToThingsES(eventStore, logger)
 
-	server.Monitor(logger, errs, httpServer)
+	server.Monitor(logger, errs, httpServer, eventStore)
 
 	logger.Info("Bootstrap service terminated")
 }
@@ -320,8 +320,7 @@ func connectToAuth(cfg config, logger logger.Logger) *grpc.ClientConn {
 	return conn
 }
 
-func subscribeToThingsES(svc bootstrap.Service, client *r.Client, consumer string, logger mflog.Logger) {
-	eventStore := rediscons.NewEventStore(svc, client, consumer, logger)
+func subscribeToThingsES(eventStore rediscons.Subscriber, logger mflog.Logger) {
 	logger.Info("Subscribed to Redis Event Store")
 	if err := eventStore.Subscribe("mainflux.things"); err != nil {
 		logger.Warn(fmt.Sprintf("Botstrap service failed to subscribe to event sourcing: %s", err))

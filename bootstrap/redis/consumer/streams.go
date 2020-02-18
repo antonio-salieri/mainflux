@@ -6,9 +6,11 @@ package consumer
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/go-redis/redis"
 	"github.com/mainflux/mainflux/bootstrap"
+	"github.com/mainflux/mainflux/internal/pkg/server"
 	"github.com/mainflux/mainflux/logger"
 )
 
@@ -29,24 +31,42 @@ const (
 
 // Subscriber represents event source for things and channels provisioning.
 type Subscriber interface {
+	server.GracefulServer
+
 	// Subscribes to given subject and receives events.
 	Subscribe(string) error
 }
 
+// RedisClient narrow interface of redis client
+type RedisClient interface {
+	XGroupCreateMkStream(stream, group, start string) *redis.StatusCmd
+	XReadGroup(a *redis.XReadGroupArgs) *redis.XStreamSliceCmd
+	XAck(stream, group string, ids ...string) *redis.IntCmd
+}
+
+type shutdownSignal uint8
+
+const (
+	req shutdownSignal = iota + 1
+	ack
+)
+
 type eventStore struct {
-	svc      bootstrap.Service
-	client   *redis.Client
-	consumer string
-	logger   logger.Logger
+	svc       bootstrap.Service
+	client    RedisClient
+	consumer  string
+	logger    logger.Logger
+	shutdownC chan shutdownSignal
 }
 
 // NewEventStore returns new event store instance.
-func NewEventStore(svc bootstrap.Service, client *redis.Client, consumer string, log logger.Logger) Subscriber {
+func NewEventStore(svc bootstrap.Service, client RedisClient, consumer string, log logger.Logger) Subscriber {
 	return eventStore{
-		svc:      svc,
-		client:   client,
-		consumer: consumer,
-		logger:   log,
+		svc:       svc,
+		client:    client,
+		consumer:  consumer,
+		logger:    log,
+		shutdownC: make(chan shutdownSignal),
 	}
 }
 
@@ -56,42 +76,84 @@ func (es eventStore) Subscribe(subject string) error {
 		return err
 	}
 
-	for {
-		streams, err := es.client.XReadGroup(&redis.XReadGroupArgs{
-			Group:    group,
-			Consumer: es.consumer,
-			Streams:  []string{stream, ">"},
-			Count:    100,
-		}).Result()
-		if err != nil || len(streams) == 0 {
-			continue
+	streamsChan := make(chan []redis.XStream)
+	go func() {
+		for {
+			es.logger.Info("XReadGroup - reading")
+			streams, err := es.client.XReadGroup(&redis.XReadGroupArgs{
+				Group:    group,
+				Consumer: es.consumer,
+				Streams:  []string{stream, ">"},
+				Count:    100,
+			}).Result()
+			es.logger.Info(fmt.Sprintf("XReadGroup - reading err: %+v", err))
+			if err != nil || len(streams) == 0 {
+				continue
+			}
+			es.logger.Info("XReadGroup - read")
+
+			streamsChan <- streams
 		}
+	}()
 
-		for _, msg := range streams[0].Messages {
-			event := msg.Values
+	for {
+		select {
+		case shutdonwReq := <-es.shutdownC:
+			if shutdonwReq != req {
+				es.logger.Error(fmt.Sprintf("Received unexpected shutdown request: %+v. Continuing ...", req))
+				continue
+			}
+			es.logger.Info("Event source listener received shutdown signal")
+			es.shutdownC <- ack
 
-			var err error
-			switch event["operation"] {
-			case thingRemove:
-				rte := decodeRemoveThing(event)
-				err = es.handleRemoveThing(rte)
-			case thingDisconnect:
-				dte := decodeDisconnectThing(event)
-				err = es.handleDisconnectThing(dte)
-			case channelUpdate:
-				uce := decodeUpdateChannel(event)
-				err = es.handleUpdateChannel(uce)
-			case channelRemove:
-				rce := decodeRemoveChannel(event)
-				err = es.handleRemoveChannel(rce)
+			return nil
+		case streams := <-streamsChan:
+			for _, msg := range streams[0].Messages {
+				event := msg.Values
+
+				var err error
+				switch event["operation"] {
+				case thingRemove:
+					rte := decodeRemoveThing(event)
+					err = es.handleRemoveThing(rte)
+				case thingDisconnect:
+					dte := decodeDisconnectThing(event)
+					err = es.handleDisconnectThing(dte)
+				case channelUpdate:
+					uce := decodeUpdateChannel(event)
+					err = es.handleUpdateChannel(uce)
+				case channelRemove:
+					rce := decodeRemoveChannel(event)
+					err = es.handleRemoveChannel(rce)
+				}
+				if err != nil {
+					es.logger.Warn(fmt.Sprintf("Failed to handle event sourcing: %s", err.Error()))
+					break
+				}
+				es.client.XAck(stream, group, msg.ID)
 			}
-			if err != nil {
-				es.logger.Warn(fmt.Sprintf("Failed to handle event sourcing: %s", err.Error()))
-				break
-			}
-			es.client.XAck(stream, group, msg.ID)
 		}
 	}
+}
+
+// Stop gracefully stops event store listener
+func (es eventStore) Stop(logger logger.Logger, timeout time.Duration) error {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+
+	logger.Info("Stopping event source listener")
+	es.shutdownC <- req
+
+	select {
+	case resp := <-es.shutdownC:
+		if resp != ack {
+			return fmt.Errorf("Event source listener received enexpected shutdown request response: %+v", resp)
+		}
+	case <-t.C:
+		return fmt.Errorf("Event source listener graceful shutdown timeout - forced exit")
+	}
+	logger.Info("Event source listener stopped without errors")
+	return nil
 }
 
 func decodeRemoveThing(event map[string]interface{}) removeEvent {
